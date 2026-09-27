@@ -20,6 +20,7 @@ import { prometheusRoutes } from "./routes/prometheus.js";
 import { healthRoutes } from "./routes/health.js";
 import { MetricsService } from "./services/metricsService.js";
 import { DrawProofService } from "./services/drawProofService.js";
+import { FeatureFlagService } from "./services/featureFlagService.js";
 import { drawProofRoutes } from "./routes/drawProofs.js";
 import { errorHandler } from "./middleware/errorHandler.js";
 import { csrfProtection } from "./middleware/csrfProtection.js";
@@ -44,6 +45,8 @@ import { DataExportService } from "./services/dataExport.js";
 import { DataImportService } from "./services/dataImport.js";
 import { exportsRoutes } from "./routes/exports.js";
 import { importsRoutes } from "./routes/imports.js";
+import { OperationalHealthService } from "./services/operationalHealthService.js";
+import { operationalHealthRoutes } from "./routes/operationalHealth.js";
 
 export type AppDeps = {
   prisma: PrismaClient;
@@ -93,7 +96,10 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       max: 100,
       timeWindow: 60_000, // 1 minute
       keyGenerator(req: FastifyRequest) {
-        return req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() || req.ip;
+        return (
+          req.headers["x-forwarded-for"]?.toString().split(",")[0].trim() ||
+          req.ip
+        );
       },
     };
     const redisClient = deps.cacheService?.redisClient;
@@ -150,17 +156,28 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   const svc = new LedgerService(deps.prisma, deps.cacheService);
   const savedPoolsSvc = new SavedPoolsService(deps.prisma);
   const metricsSvc = new MetricsService(deps.prisma);
-  const drawProofSvc = new DrawProofService(deps.prisma, null, deps.logger);
+
+  // Feature flag service for runtime toggles
+  const featureFlagSvc = new FeatureFlagService(deps.prisma);
+
+  const drawProofSvc = new DrawProofService(
+    deps.prisma,
+    null,
+    deps.logger,
+    featureFlagSvc,
+  );
   const schemaVersionSvc = new SchemaVersionService(deps.prisma);
   const auditSvc = new AuditService(deps.prisma);
 
-  const jobQueue = deps.jobStore ? new JobQueue({ store: deps.jobStore }) : undefined;
+  const jobQueue = deps.jobStore
+    ? new JobQueue({ store: deps.jobStore })
+    : undefined;
   if (jobQueue) {
     const worker = new JobWorker({
       queue: jobQueue,
       handlers: createJobHandlers({ drawProofs: drawProofSvc }),
       logger: loggerInstance,
-      pollIntervalMs: deps.jobWorkerPollIntervalMs
+      pollIntervalMs: deps.jobWorkerPollIntervalMs,
     });
     app.decorate("jobQueue", jobQueue);
     app.decorate("jobWorker", worker);
@@ -177,10 +194,13 @@ export function buildApp(deps: AppDeps): FastifyInstance {
         .enqueue({
           type: JOB_TYPES.DRAW_PROOF_GENERATE,
           payload: { actionId },
-          idempotencyKey: drawProofJobKey(actionId)
+          idempotencyKey: drawProofJobKey(actionId),
         })
         .catch((err) => {
-          deps.logger?.error({ err, actionId }, "failed to enqueue draw proof job");
+          deps.logger?.error(
+            { err, actionId },
+            "failed to enqueue draw proof job",
+          );
         });
       return;
     }
@@ -194,10 +214,21 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   const apiKeyGuard = requireApiKey(deps.apiKey);
 
   const walletAuthSvc = new WalletAuthService(deps.prisma);
-  const walletPrincipal = walletSessionResolver(walletAuthSvc, deps.adminWalletAddresses ?? []);
-  const categorySvc = new CategoryService(deps.prisma, deps.cacheService, deps.categoriesCacheTtlSeconds);
-  const notificationSvc = new NotificationService(deps.prisma, deps.reminderLeadHours);
+  const walletPrincipal = walletSessionResolver(
+    walletAuthSvc,
+    deps.adminWalletAddresses ?? [],
+  );
+  const categorySvc = new CategoryService(
+    deps.prisma,
+    deps.cacheService,
+    deps.categoriesCacheTtlSeconds,
+  );
+  const notificationSvc = new NotificationService(
+    deps.prisma,
+    deps.reminderLeadHours,
+  );
   const dashboardAggregateSvc = new DashboardAggregateService(deps.prisma);
+  const operationalHealthSvc = new OperationalHealthService(deps.prisma);
 
   // Register routes (healthRoutes already includes /health endpoint)
   app.register(actionsRoutes(svc, apiKeyGuard));
@@ -205,8 +236,17 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   app.register(healthRoutes(svc));
   app.register(savedPoolsRoutes(savedPoolsSvc));
   app.register(schemaVersionRoutes(schemaVersionSvc));
-  app.register(internalRoutes(svc, deps.internalSecret, new TransactionTraceService(deps.prisma)));
+  app.register(
+    internalRoutes(
+      svc,
+      deps.internalSecret,
+      new TransactionTraceService(deps.prisma),
+    ),
+  );
   app.register(reconciliationRoutes(deps.prisma, deps.internalSecret));
+  app.register(
+    operationalHealthRoutes(operationalHealthSvc, deps.internalSecret),
+  );
   if (jobQueue) app.register(jobsRoutes(jobQueue, deps.internalSecret));
   app.register(usersRoutes, { prefix: "/api/users", prisma: deps.prisma });
   app.register(metricsRoutes(metricsSvc, apiKeyGuard));
@@ -227,12 +267,22 @@ export function buildApp(deps: AppDeps): FastifyInstance {
   // Wallet-scoped data portability (#772, #773). Authorization is enforced by
   // the permission guards and by the services' own wallet-scope checks.
   const exportSvc = new DataExportService({
-    listActions: ({ walletAddress, cursor, limit }) => svc.listActions({ walletAddress, cursor, limit }),
-    listSavedPools: (wallet, cursor, limit) => savedPoolsSvc.listSavedPools(wallet, cursor, limit),
+    listActions: ({ walletAddress, cursor, limit }) =>
+      svc.listActions({ walletAddress, cursor, limit }),
+    listSavedPools: (wallet, cursor, limit) =>
+      savedPoolsSvc.listSavedPools(wallet, cursor, limit),
   });
-  app.register(exportsRoutes(exportSvc, requirePermission("own.data.export", [walletPrincipal])));
   app.register(
-    importsRoutes(new DataImportService(savedPoolsSvc), requirePermission("own.data.import", [walletPrincipal])),
+    exportsRoutes(
+      exportSvc,
+      requirePermission("own.data.export", [walletPrincipal]),
+    ),
+  );
+  app.register(
+    importsRoutes(
+      new DataImportService(savedPoolsSvc),
+      requirePermission("own.data.import", [walletPrincipal]),
+    ),
   );
 
   // Central Error Handler Middleware
