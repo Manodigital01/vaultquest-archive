@@ -7,9 +7,9 @@
     "node": "^20 || ^22 || ^24"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "build": "prisma generate && tsc -p tsconfig.json",
-    "start": "node dist/server.js",
+    "dev": "node api.js && tsx watch src/server.ts",
+    "build": "node api.js && prisma generate && tsc -p tsconfig.json",
+    "start": "node api.js && node dist/server.js",
     "db:backup": "tsx src/scripts/backup.ts",
     "indexer:backfill": "tsx src/scripts/backfill.ts",
     "dr:drill": "tsx src/scripts/drDrill.ts",
