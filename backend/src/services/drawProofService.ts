@@ -12,11 +12,29 @@ import {
 } from "../../../lib/draw-proof.js";
 
 export interface RpcClient {
-  getLedger(ledgerSeq: number): Promise<{ sequence: number; closedAt: string; hash: string }>;
-  getTransaction(txHash: string): Promise<{ hash: string; ledger: number; successful: boolean; status: string }>;
+  getLedger(
+    ledgerSeq: number,
+  ): Promise<{ sequence: number; closedAt: string; hash: string }>;
+  getTransaction(txHash: string): Promise<{
+    hash: string;
+    ledger: number;
+    successful: boolean;
+    status: string;
+  }>;
   getContractData(contractId: string, key: string): Promise<{ value: string }>;
-  getEvents(opts: { contractId: string; topic?: string[]; startLedger?: number; limit?: number }): Promise<{
-    events: Array<{ id: string; ledger: number; txHash: string; topicXdr: string[]; valueXdr: string }>;
+  getEvents(opts: {
+    contractId: string;
+    topic?: string[];
+    startLedger?: number;
+    limit?: number;
+  }): Promise<{
+    events: Array<{
+      id: string;
+      ledger: number;
+      txHash: string;
+      topicXdr: string[];
+      valueXdr: string;
+    }>;
   }>;
 }
 
@@ -43,29 +61,60 @@ export class DrawProofService {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly rpc: RpcClient | null,
-    private readonly logger?: Logger
+    private readonly logger?: Logger,
+    private readonly featureFlagService?: any, // injected at app initialization
   ) {}
 
-  generateProof(options: GenerateProofOptions): Promise<DrawProofRecord | null> {
-    return withTelemetry({ operation: "draw_proof.generate", actorType: "worker" }, () =>
-      this.generateProofImpl(options)
+  generateProof(
+    options: GenerateProofOptions,
+  ): Promise<DrawProofRecord | null> {
+    return withTelemetry(
+      { operation: "draw_proof.generate", actorType: "worker" },
+      () => this.generateProofImpl(options),
     );
   }
 
-  private async generateProofImpl(options: GenerateProofOptions): Promise<DrawProofRecord | null> {
+  private async generateProofImpl(
+    options: GenerateProofOptions,
+  ): Promise<DrawProofRecord | null> {
+    // Feature flag: PRIZE_DRAW_EXECUTION controls whether proofs are actually generated
+    // Safe default (when flag service unavailable or flag disabled): skip generation
+    if (this.featureFlagService) {
+      const isEnabled = await this.featureFlagService.isEnabled(
+        "prize-draw-execution",
+      );
+      if (!isEnabled) {
+        this.logger?.info(
+          { actionId: options.actionId },
+          "draw proof generation skipped: PRIZE_DRAW_EXECUTION flag is disabled",
+        );
+        return null;
+      }
+    } else {
+      // No feature flag service configured; default to safe behavior (skip)
+      this.logger?.debug(
+        { actionId: options.actionId },
+        "draw proof generation skipped: no feature flag service configured (safe default)",
+      );
+      return null;
+    }
+
     const action = await this.prisma.actionLedger.findUnique({
       where: { id: options.actionId },
     });
 
     if (!action) {
-      this.logger?.warn({ actionId: options.actionId }, "draw proof: action not found");
+      this.logger?.warn(
+        { actionId: options.actionId },
+        "draw proof: action not found",
+      );
       return null;
     }
 
     if (action.actionType !== "select_winner") {
       this.logger?.warn(
         { actionId: options.actionId, type: action.actionType },
-        "draw proof: action is not select_winner"
+        "draw proof: action is not select_winner",
       );
       return null;
     }
@@ -73,27 +122,34 @@ export class DrawProofService {
     if (action.status !== "confirmed") {
       this.logger?.warn(
         { actionId: options.actionId, status: action.status },
-        "draw proof: action not confirmed"
+        "draw proof: action not confirmed",
       );
       return null;
     }
 
     const payload = (action.actionPayload ?? {}) as Record<string, unknown>;
-    const contractId = String(payload.contract_id || payload.pool_id || "unknown");
+    const contractId = String(
+      payload.contract_id || payload.pool_id || "unknown",
+    );
     const roundId = Number(payload.round_id || 0);
     const winnerAddress = String(payload.winner || payload.winnerAddress || "");
     const prizeAmount = String(payload.prize || payload.amount || "0");
-    const drawLedger = Number(payload.draw_ledger || action.submittedAt?.getTime() || Date.now());
+    const drawLedger = Number(
+      payload.draw_ledger || action.submittedAt?.getTime() || Date.now(),
+    );
 
     if (!winnerAddress) {
-      this.logger?.warn({ actionId: options.actionId }, "draw proof: no winner in payload");
+      this.logger?.warn(
+        { actionId: options.actionId },
+        "draw proof: no winner in payload",
+      );
       return null;
     }
 
     if (!this.rpc) {
       this.logger?.warn(
         { actionId: options.actionId },
-        "draw proof: no RPC client configured, refusing to fabricate randomness evidence"
+        "draw proof: no RPC client configured, refusing to fabricate randomness evidence",
       );
       return null;
     }
@@ -107,7 +163,10 @@ export class DrawProofService {
     try {
       participants = await this.fetchParticipants(contractId, drawLedger);
       poolState = await this.fetchPoolState(contractId);
-      roundPrincipalSnapshot = await this.fetchRoundPrincipalSnapshot(contractId, roundId);
+      roundPrincipalSnapshot = await this.fetchRoundPrincipalSnapshot(
+        contractId,
+        roundId,
+      );
       if (action.txHash) {
         const tx = await this.rpc.getTransaction(action.txHash);
         if (tx) {
@@ -115,17 +174,24 @@ export class DrawProofService {
         }
       }
     } catch (err) {
-      this.logger?.warn({ err, contractId }, "draw proof: RPC fetch failed, using empty data");
+      this.logger?.warn(
+        { err, contractId },
+        "draw proof: RPC fetch failed, using empty data",
+      );
     }
 
     // Real randomness evidence must come from the contract's own commit/reveal
     // (or beacon) event — never derived from public identifiers, which would
     // be predictable and defeat the whole point of the proof (#494).
-    const randomness = await this.fetchRandomnessEvidence(contractId, roundId, drawLedger);
+    const randomness = await this.fetchRandomnessEvidence(
+      contractId,
+      roundId,
+      drawLedger,
+    );
     if (!randomness) {
       this.logger?.warn(
         { actionId: options.actionId, contractId, roundId },
-        "draw proof: no on-chain randomness evidence found, refusing to generate proof"
+        "draw proof: no on-chain randomness evidence found, refusing to generate proof",
       );
       return null;
     }
@@ -177,7 +243,7 @@ export class DrawProofService {
 
     this.logger?.info(
       { drawId: proof.drawId, roundId, winner: winnerAddress },
-      "draw proof: generated"
+      "draw proof: generated",
     );
 
     return this.toRecord(created);
@@ -211,7 +277,11 @@ export class DrawProofService {
     });
 
     return {
-      record: this.toRecord({ ...record, verified: verification.verified, verifiedAt: new Date() }),
+      record: this.toRecord({
+        ...record,
+        verified: verification.verified,
+        verifiedAt: new Date(),
+      }),
       verification,
     };
   }
@@ -264,10 +334,10 @@ export class DrawProofService {
           contractId: String(
             (action.actionPayload as Record<string, unknown>)?.contract_id ||
               (action.actionPayload as Record<string, unknown>)?.pool_id ||
-              "unknown"
+              "unknown",
           ),
           roundId: Number(
-            (action.actionPayload as Record<string, unknown>)?.round_id || 0
+            (action.actionPayload as Record<string, unknown>)?.round_id || 0,
           ),
         },
       });
@@ -281,7 +351,10 @@ export class DrawProofService {
       }
     }
 
-    this.logger?.info({ generated, total: confirmedDraws.length }, "draw proof: retroactive generation complete");
+    this.logger?.info(
+      { generated, total: confirmedDraws.length },
+      "draw proof: retroactive generation complete",
+    );
     return generated;
   }
 
@@ -293,7 +366,7 @@ export class DrawProofService {
   private async fetchRandomnessEvidence(
     contractId: string,
     roundId: number,
-    drawLedger: number
+    drawLedger: number,
   ): Promise<{
     source: "soroban_prng" | "external_beacon";
     seed: string;
@@ -313,7 +386,9 @@ export class DrawProofService {
       for (const evt of events) {
         let decoded: Record<string, unknown>;
         try {
-          decoded = JSON.parse(Buffer.from(evt.valueXdr, "base64").toString("utf8"));
+          decoded = JSON.parse(
+            Buffer.from(evt.valueXdr, "base64").toString("utf8"),
+          );
         } catch {
           continue;
         }
@@ -322,25 +397,42 @@ export class DrawProofService {
         const seed = String(decoded.seed || "");
         const commitment = String(decoded.commitment || "");
         const commitmentLedgerSeq = Number(decoded.commitment_ledger || 0);
-        const source = decoded.source === "external_beacon" ? "external_beacon" : "soroban_prng";
+        const source =
+          decoded.source === "external_beacon"
+            ? "external_beacon"
+            : "soroban_prng";
 
-        if (!seed || !commitment || !commitmentLedgerSeq || commitmentLedgerSeq > drawLedger) {
+        if (
+          !seed ||
+          !commitment ||
+          !commitmentLedgerSeq ||
+          commitmentLedgerSeq > drawLedger
+        ) {
           continue;
         }
 
-        return { source, seed, commitment, commitmentLedgerSeq, revealTxHash: evt.txHash };
+        return {
+          source,
+          seed,
+          commitment,
+          commitmentLedgerSeq,
+          revealTxHash: evt.txHash,
+        };
       }
 
       return null;
     } catch (err) {
-      this.logger?.warn({ err, contractId, roundId }, "draw proof: failed to fetch randomness evidence");
+      this.logger?.warn(
+        { err, contractId, roundId },
+        "draw proof: failed to fetch randomness evidence",
+      );
       return null;
     }
   }
 
   private async fetchParticipants(
     contractId: string,
-    _atLedger: number
+    _atLedger: number,
   ): Promise<ParticipantEntry[]> {
     if (!this.rpc) return [];
 
@@ -353,7 +445,10 @@ export class DrawProofService {
 
       for (const admin of admins) {
         try {
-          const pData = await this.rpc.getContractData(contractId, `Participant:${admin}`);
+          const pData = await this.rpc.getContractData(
+            contractId,
+            `Participant:${admin}`,
+          );
           const p = JSON.parse(pData.value) as Record<string, unknown>;
           participants.push({
             address: String(admin),
@@ -371,7 +466,9 @@ export class DrawProofService {
     }
   }
 
-  private async fetchPoolState(contractId: string): Promise<Record<string, unknown>> {
+  private async fetchPoolState(
+    contractId: string,
+  ): Promise<Record<string, unknown>> {
     if (!this.rpc) return {};
 
     try {
@@ -392,15 +489,20 @@ export class DrawProofService {
    */
   private async fetchRoundPrincipalSnapshot(
     contractId: string,
-    roundId: number
+    roundId: number,
   ): Promise<string | undefined> {
     if (!this.rpc) return undefined;
 
     try {
-      const data = await this.rpc.getContractData(contractId, `Round:${roundId}`);
+      const data = await this.rpc.getContractData(
+        contractId,
+        `Round:${roundId}`,
+      );
       const round = JSON.parse(data.value) as Record<string, unknown>;
       const snapshot = round.principal_snapshot ?? round.principalSnapshot;
-      return snapshot === undefined || snapshot === null ? undefined : String(snapshot);
+      return snapshot === undefined || snapshot === null
+        ? undefined
+        : String(snapshot);
     } catch {
       return undefined;
     }

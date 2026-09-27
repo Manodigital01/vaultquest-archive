@@ -398,6 +398,37 @@ model RepairQuarantine {
   @@map("repair_quarantine")
 }
 
+// Feature flags for staged rollout and emergency rollback
+// Defaults are always the safer behavior (disabled for new features, enabled for safeguards)
+model FeatureFlag {
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String   @unique
+  enabled     Boolean  @default(false)
+  description String?
+  scope       String   @default("global") // "global", "vault:{id}", "wallet:{address}"
+  metadata    Json?
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([key, scope])
+  @@index([scope])
+  @@map("feature_flags")
+}
+
+model FeatureFlagAudit {
+  id          String   @id @default(uuid()) @db.Uuid
+  flagKey     String   @map("flag_key")
+  previousValue Boolean @map("previous_value")
+  newValue    Boolean  @map("new_value")
+  actor       String?
+  reason      String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([flagKey, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@map("feature_flag_audits")
+}
+
 model SavedPool {
   id               String   @id @default(uuid()) @db.Uuid
   walletAddress    String   @map("wallet_address")
